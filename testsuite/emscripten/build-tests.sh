@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 emcc_exists="$(command -v emcc)"
 if [ ! "${emcc_exists}" ]; then
   echo "Emscripten not on path"
@@ -23,7 +23,7 @@ export LDFLAGS=" \
 "
 
 if [ -n "${WASM_BIGINT+x}" ] ; then
-    export LDFLAGS+=" -sWASM_BIGINT"
+  export LDFLAGS+=" -sWASM_BIGINT"
 fi
 
 # Rename main functions to test__filename so we can link them together
