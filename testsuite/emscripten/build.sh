@@ -16,7 +16,7 @@ if [ -z "${WASM_BIGINT+x}" ] ; then
   WASM_BIGINT=false
 else
   WASM_BIGINT=true
-done
+fi
 
 # Parse arguments
 while [ $# -gt 0 ]; do
