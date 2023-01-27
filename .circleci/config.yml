@@ -30,6 +30,13 @@ jobs:
             - emsdk
 
   build-libffi:
+    parameters:
+      wasm-bigint:
+        description: Should we build with wasm-bigint?
+        type: string
+        default: ""
+    environment:
+      WASM_BIGINT: << parameters.wasm-bigint >>
     <<: *defaults
     steps:
       - checkout
@@ -48,35 +55,6 @@ jobs:
             source ./emsdk/emsdk_env.sh
             cp -r testsuite/libffi.call testsuite/libffi.call.test
             cp -r testsuite/libffi.closures testsuite/libffi.closures.test
-            ./testsuite/emscripten/build-tests.sh testsuite/libffi.call.test
-            ./testsuite/emscripten/build-tests.sh testsuite/libffi.closures.test
-
-      - persist_to_workspace:
-          root: .
-          paths:
-            - target
-            - testsuite
-
-  build-libffi-bigint:
-    <<: *defaults
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-
-      - run:
-          name: build
-          command: |
-            source ./emsdk/emsdk_env.sh
-            ./testsuite/emscripten/build.sh --enable-wasm-bigint
-
-      - run:
-          name: build tests
-          command: |
-            source ./emsdk/emsdk_env.sh
-            cp -r testsuite/libffi.call testsuite/libffi.call.test
-            cp -r testsuite/libffi.closures testsuite/libffi.closures.test
-            export EXTRA_LD_FLAGS="-s WASM_BIGINT"
             ./testsuite/emscripten/build-tests.sh testsuite/libffi.call.test
             ./testsuite/emscripten/build-tests.sh testsuite/libffi.closures.test
 
@@ -201,9 +179,13 @@ workflows:
       - install-emsdk
 
       - build-libffi:
+          name: build-libffi
           requires:
             - install-emsdk
-      - build-libffi-bigint:
+
+      - build-libffi:
+          name: build-libffi-bigint
+          wasm-bigint: true
           requires:
             - install-emsdk
 

@@ -12,7 +12,11 @@ mkdir -p $TARGET
 # Define default arguments
 
 # JS BigInt to Wasm i64 integration, disabled by default
-WASM_BIGINT=false
+if [ -z "${WASM_BIGINT+x}" ] ; then
+  WASM_BIGINT=false
+else
+  WASM_BIGINT=true
+done
 
 # Parse arguments
 while [ $# -gt 0 ]; do

@@ -22,6 +22,10 @@ export LDFLAGS=" \
     $EXTRA_LD_FLAGS \
 "
 
+if [ -n "${WASM_BIGINT+x}" ] ; then
+  LDFLAGS+=" -sWASM_BIGINT"
+done
+
 # Rename main functions to test__filename so we can link them together
 ls *c | sed 's!\(.*\)\.c!sed -i "s/main/test__\1/g" \0!g' | bash
 
