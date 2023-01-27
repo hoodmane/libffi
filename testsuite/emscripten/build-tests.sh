@@ -22,7 +22,7 @@ export LDFLAGS=" \
     $EXTRA_LD_FLAGS \
 "
 
-if [ -n "${WASM_BIGINT+x}" ] ; then
+if [ -n "${WASM_BIGINT}" ] ; then
   export LDFLAGS+=" -sWASM_BIGINT"
 fi
 
