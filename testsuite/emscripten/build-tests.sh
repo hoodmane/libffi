@@ -23,7 +23,7 @@ export LDFLAGS=" \
 "
 
 if [ -n "${WASM_BIGINT+x}" ] ; then
-  LDFLAGS+=" -sWASM_BIGINT"
+    export LDFLAGS+=" -sWASM_BIGINT"
 fi
 
 # Rename main functions to test__filename so we can link them together
