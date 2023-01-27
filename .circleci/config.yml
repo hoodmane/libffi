@@ -1,4 +1,4 @@
-version: 2
+version: 2.1
 
 defaults: &defaults
   working_directory: ~/repo
@@ -185,7 +185,7 @@ workflows:
 
       - build-libffi:
           name: build-libffi-bigint
-          wasm-bigint: true
+          wasm-bigint: "true"
           requires:
             - install-emsdk
 
