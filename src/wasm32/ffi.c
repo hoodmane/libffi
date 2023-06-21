@@ -487,7 +487,7 @@ ffi_call_get_ptr, (),
     }
     ffi_call_js_set_rvalue(rtype_id, rvalue, result);
   }
-  return addFunction(getHandlerFn(call_generator, "viiii"));
+  return addFunction(Module.getHandlerFn(call_generator, "viiii"));
 });
 
 void ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue) {
@@ -931,7 +931,7 @@ ffi_prep_closure_loc_js,
   }
 
   try {
-    var wasm_trampoline = Module.getHandlerFn(closure, "v" + "i".repeat(nfixedargs + (nfixedargs !== nargs)));
+    var wasm_trampoline = Module.getHandlerFn(trampoline, sig);
   } catch(e) {
     return FFI_BAD_TYPEDEF_MACRO;
   }
