@@ -253,6 +253,36 @@ function createSelector(sync_fn, async_wrapper) {
 }
 Module.createSelector = createSelector;
 
+function syncHandler(genfunc, ...args) {
+  let gen = genfunc(...args);
+  let [fptr, call_args] = gen.next().value;
+  return gen.next(getWasmTableEntry(fptr)(...call_args)).value;
+}
+
+async function promisingHandler(genfunc, ...args) {
+  let gen = genfunc(...args);
+  let [fptr, call_args] = gen.next().value;
+  return gen.next(await createPromising(getWasmTableEntry(fptr))(...call_args))
+    .value;
+}
+
+function getHandlerFn(trampoline, sig) {
+  const sync_fn = syncHandler.bind(null, trampoline);
+  if (Module.suspendersAvailable) {
+    const wasmsig = emscriptenSigToWasm(sig);
+    wasmsig.parameters.unshift("externref");
+    const async_wrapper = new WebAssembly.Function(
+      wasmsig,
+      promisingHandler.bind(null, trampoline),
+      { suspending: "first" },
+    );
+    return createSelector(sync_fn, async_wrapper);
+  } else {
+    return convertJsFunctionToWasm(sync_fn, sig);
+  }
+}
+Module.getHandlerFn = getHandlerFn;
+
 function ffi_call_js_prepare_args(cif, rvalue, avalue) {
   var abi = CIF__ABI(cif);
   var nargs = CIF__NARGS(cif);
