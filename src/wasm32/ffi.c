@@ -187,9 +187,73 @@ unbox_small_structs, (ffi_type type_ptr), {
   return [type_ptr, type_id];
 })
 
-EM_JS_MACROS(
-void,
-ffi_call_js_prepare_args, (int cif, int rvalue, int avalue) , {
+EM_JS_MACROS(void, __ffi_module_help, (), {}
+const selectorModuleMap = new Map();
+function createSelectorModule(async_type) {
+  const async_type_str = wasmTypeToString(async_type);
+  if (selectorModuleMap.has(async_type_str)) {
+    return selectorModuleMap.get(async_type_str);
+  }
+  const mod = new WasmModule();
+  const sync_type = structuredClone(async_type);
+  sync_type.parameters.shift();
+  const ts = new TypeSection();
+  const async_tidx = ts.addWasm(async_type);
+  const sync_tidx = ts.addWasm(sync_type);
+  mod.addSection(ts);
+
+  const imports = new ImportSection();
+
+  const suspenderCheck = imports.addGlobal("c", "i32");
+  const suspenderGlobal = imports.addGlobal("s", "externref");
+  const sync_fn = imports.addFunction("f", sync_tidx);
+  const async_fn = imports.addFunction("a", async_tidx);
+  mod.addImportSection(imports);
+  mod.setExportType(sync_tidx);
+
+  const code = new CodeSection("externref");
+  const suspenderLocal = sync_type.parameters.length;
+  code.global_get(suspenderCheck);
+  code.add(0x45); // i32.eqz
+  code.add(0x04, 0x40); // if
+  for (let i = 0; i < sync_type.parameters.length; i++) {
+    code.local_get(i);
+  }
+  code.call(sync_fn);
+  code.add(0x0f); // return
+  code.end(); // end if
+
+  code.global_get(suspenderGlobal);
+  code.local_tee(suspenderLocal);
+  for (let i = 0; i < sync_type.parameters.length; i++) {
+    code.local_get(i);
+  }
+  code.call(async_fn);
+  code.local_get(suspenderLocal);
+  code.global_set(suspenderGlobal);
+  code.end();
+  mod.addSection(code);
+  const module = mod.generate();
+  selectorModuleMap.set(async_type_str, module);
+  return module;
+}
+
+function createSelector(sync_fn, async_wrapper) {
+  const async_type = WebAssembly.Function.type(async_wrapper);
+  const module = createSelectorModule(async_type);
+  const instance = new WebAssembly.Instance(module, {
+    e: {
+      a: async_wrapper,
+      f: sync_fn,
+      s: Module.suspenderGlobal,
+      c: Module.validSuspender,
+    },
+  });
+  return instance.exports["o"];
+}
+Module.createSelector = createSelector;
+
+function ffi_call_js_prepare_args(cif, rvalue, avalue) {
   var abi = CIF__ABI(cif);
   var nargs = CIF__NARGS(cif);
   var nfixedargs = CIF__NFIXEDARGS(cif);
@@ -421,10 +485,7 @@ ffi_call_js_prepare_args, (int cif, int rvalue, int avalue) , {
   stackAlloc(0); // stackAlloc enforces alignment invariants on the stack pointer
   return {args, rtype_id, ret_by_arg};
 }
-)
-
-EM_JS_MACROS(void, ffi_call_js_set_rvalue, (int rtype_id, int rvalue, int result), {
-
+function ffi_call_js_set_rvalue(rtype_id, rvalue, result) {
   // Otherwise the result was automatically converted from C into Javascript and
   // we need to manually convert it back to C.
   switch (rtype_id) {
@@ -464,7 +525,8 @@ EM_JS_MACROS(void, ffi_call_js_set_rvalue, (int rtype_id, int rvalue, int result
   default:
     throw new Error('Unexpected rtype ' + rtype_id);
   }
-})
+}
+)
 
 typedef void FfiCallType(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue);
 
