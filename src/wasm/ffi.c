@@ -172,8 +172,10 @@ CHECK_FIELD_OFFSET(ffi_type, elements, 16);
 #define ALIGN_ADDRESS(addr, align) (addr &= (~((align) - 1)))
 #define STACK_ALLOC(stack, size, align) ((stack -= (size)), ALIGN_ADDRESS(stack, align))
 
-// Most wasm runtimes support at most 1000 Js trampoline args.
-#define MAX_ARGS 1000
+// Wasm engines allow at most 1000 params and 1000 results per function. The
+// ffi_call prelude returns all of the arguments plus four bookkeeping values
+// as a multivalue result, so leave room for those.
+#define MAX_ARGS 996
 
 #include <stddef.h>
 
@@ -263,15 +265,66 @@ unbox_small_structs, (ffi_type type_ptr), {
   return [type_ptr, type_id];
 })
 
+/**
+ * ffi_call and JSPI
+ *
+ * ffi_call has to end up calling fn with the marshalled arguments. Doing the
+ * call from JavaScript (getWasmTableEntry(fn)(...args)) leaves a JS frame on
+ * the stack, so if fn suspends via JSPI the engine traps with "trying to
+ * suspend JS frames". Instead, ffi_call calls a small generated wasm
+ * trampoline through the function table, and the trampoline makes the onward
+ * call with call_indirect:
+ *
+ *    trampoline(cif, fn, rvalue, avalue):
+ *      call prelude(cif, fn, rvalue, avalue)
+ *      call_indirect fn(...args)
+ *      call epilogue(cif, orig_stack_ptr, rvalue, result)
+ *
+ * prelude() is a JavaScript helper that marshals the arguments from avalue
+ * onto the C stack / into wasm values and returns everything the rest of the
+ * body consumes, in stack order: cif, orig_stack_ptr, rvalue, ...args, fn.
+ * epilogue() restores the stack pointer and stores the result into rvalue.
+ *
+ * The trampoline's wasm type only depends on the cif's signature string, so
+ * we compile one module per signature, instantiate it once, and cache the
+ * table index it lives at.
+ */
 EM_JS_MACROS(
-void,
-ffi_call_js, (ffi_cif *cif, ffi_fp fn, void *rvalue, void **avalue),
+void *,
+ffi_call_get_trampoline_js, (ffi_cif *cif),
 {
   cif = DEC_PTR(cif);
-  fn = DEC_PTR(fn);
+  var sig = ffi_cif_to_call_info(cif).sig;
+  var index = ffi_call_trampoline_cache.get(sig);
+  if (index === undefined) {
+    LOG_DEBUG("CREATE_CALL_TRAMPOLINE", "sig:", sig);
+    var instance = new WebAssembly.Instance(
+      ffi_call_trampoline_module(sig),
+      {
+        e: {
+          p: ffi_call_prelude,
+          e: ffi_call_epilogue(sig),
+          t: wasmTable,
+        },
+      },
+    );
+    index = getEmptyTableSlot();
+    setWasmTableEntry(index, instance.exports["f"]);
+    ffi_call_trampoline_cache.set(sig, index);
+  }
+  return ENC_PTR(index);
+}
+
+var ffi_call_trampoline_cache = new Map();
+
+// Called by the ffi_call trampoline. Marshals the arguments from avalue and
+// returns what the trampoline needs to make the onward call, in operand stack
+// order: the epilogue's arguments, then the call_indirect arguments, then the
+// table index.
+function ffi_call_prelude(cif, fn, rvalue, avalue) {
+  cif = DEC_PTR(cif);
   rvalue = DEC_PTR(rvalue);
   avalue = DEC_PTR(avalue);
-  var abi = CIF__ABI(cif);
   var nargs = CIF__NARGS(cif);
   var nfixedargs = CIF__NFIXEDARGS(cif);
   var arg_types_ptr = DEC_PTR(CIF__ARGTYPES(cif));
@@ -279,47 +332,31 @@ ffi_call_js, (ffi_cif *cif, ffi_fp fn, void *rvalue, void **avalue),
   var rtype_unboxed = unbox_small_structs(CIF__RTYPE(cif));
   var rtype_ptr = rtype_unboxed[0];
   var rtype_id = rtype_unboxed[1];
-  // A small struct return is unboxed to a scalar type id above, but it is
-  // still a struct to the caller: its buffer is exactly the struct's size,
-  // so it must not get the integral widening to ffi_arg.
-  var rtype_widen = FFI_TYPE__TYPEID(DEC_PTR(CIF__RTYPE(cif))) !== FFI_TYPE_STRUCT;
   var orig_stack_ptr = stackSave();
   var cur_stack_ptr = orig_stack_ptr;
 
-  var args = [];
-  // Does our onwards call return by argument or normally? We return by argument
-  // no matter what.
-  var ret_by_arg = false;
+  // The epilogue's arguments go first. It gets the original rvalue, which may
+  // be NULL, so it knows whether there is anything to store.
+  var args = [ENC_PTR(cif), ENC_PTR(orig_stack_ptr), ENC_PTR(rvalue)];
 
-  if (rtype_id === FFI_TYPE_COMPLEX) {
-    throw new Error('complex ret marshalling nyi');
-  }
-  if (rtype_id < 0 || rtype_id > FFI_TYPE_LAST) {
-    throw new Error('Unexpected rtype ' + rtype_id);
-  }
   // If the return type is a struct with multiple entries or a long double, the
   // function takes an extra first argument which is a pointer to return value.
   // Conveniently, we've already received a pointer to return value, so we can
-  // just use this. We also mark a flag that we don't need to convert the return
-  // value of the dynamic call back to C.
+  // just use this.
   if (rtype_id === FFI_TYPE_LONGDOUBLE || rtype_id === FFI_TYPE_STRUCT) {
     if (rvalue === 0) {
       // NULL rvalue: the caller discards the result, but the callee still
       // needs somewhere to write it. Allocate scratch space on the stack;
-      // it is released by the stackRestore after the call.
+      // it is released by the stackRestore in the epilogue.
       var rsize = DEC_PTR(FFI_TYPE__SIZE(rtype_ptr));
       var ralign = FFI_TYPE__ALIGN(rtype_ptr);
       STACK_ALLOC(cur_stack_ptr, rsize, ralign);
       rvalue = cur_stack_ptr;
     }
     args.push(ENC_PTR(rvalue));
-    ret_by_arg = true;
   }
 
-  // Accumulate a Javascript list of arguments for the Javascript wrapper for
-  // the wasm function. The Javascript wrapper does a type conversion from
-  // Javascript to C automatically, here we manually do the inverse conversion
-  // from C to Javascript.
+  // Convert each C argument into the wasm value the callee expects.
   for (var i = 0; i < nfixedargs; i++) {
     var arg_ptr = DEREF_PTR_NUMBER(avalue, i);
     var arg_unboxed = unbox_small_structs(DEREF_PTR(arg_types_ptr, i));
@@ -464,89 +501,221 @@ ffi_call_js, (ffi_cif *cif, ffi_fp fn, void *rvalue, void **avalue),
   stackRestore(cur_stack_ptr);
   stackAlloc(0); // stackAlloc enforces alignment invariants on the stack pointer
   LOG_DEBUG("CALL_FUNC_PTR", "fn:", fn, "args:", args);
-  var result = getWasmTableEntry(fn).apply(null, args);
-  // Put the stack pointer back (we moved it if there were any struct args or we
-  // made a varargs call)
-  stackRestore(orig_stack_ptr);
+  // Finally the table index for call_indirect.
+  args.push(fn);
+  return args;
+}
 
-  // We need to return by argument. If return value was a nontrivial struct or
-  // long double, the onwards call already put the return value in rvalue
-  if (ret_by_arg) {
-    return;
+// Returns the epilogue for the ffi_call trampoline with the given signature.
+// It restores the stack pointer and stores the callee's result into rvalue.
+function ffi_call_epilogue(sig) {
+  if (sig[0] === 'v') {
+    // Void return, or the callee already wrote the result through the return
+    // pointer argument. Nothing to store.
+    return function epilogue(cif, orig_stack_ptr, rvalue) {
+      stackRestore(DEC_PTR(orig_stack_ptr));
+    };
+  }
+  return function epilogue(cif, orig_stack_ptr, rvalue, result) {
+    stackRestore(DEC_PTR(orig_stack_ptr));
+    cif = DEC_PTR(cif);
+    rvalue = DEC_PTR(rvalue);
+    // A NULL rvalue means the caller discards the return value.
+    if (rvalue === 0) {
+      return;
+    }
+    var rtype_id = unbox_small_structs(CIF__RTYPE(cif))[1];
+    // A small struct return is unboxed to a scalar type id above, but it is
+    // still a struct to the caller: its buffer is exactly the struct's size,
+    // so it must not get the integral widening to ffi_arg.
+    var rtype_widen = FFI_TYPE__TYPEID(DEC_PTR(CIF__RTYPE(cif))) !== FFI_TYPE_STRUCT;
+    // Integral returns narrower than a register are widened to ffi_arg, as
+    // documented and as every native port does -- but only genuine scalar
+    // returns: an unboxed small-struct return keeps its natural width.
+    switch (rtype_id) {
+    case FFI_TYPE_INT:
+    case FFI_TYPE_SINT32:
+      if (rtype_widen)
+        STORE_ARG_WIDENED_SIGNED(rvalue, result | 0);
+      else
+        DEREF_U32(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_UINT32:
+      if (rtype_widen)
+        STORE_ARG_WIDENED_UNSIGNED(rvalue, result | 0);
+      else
+        DEREF_U32(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_FLOAT:
+      DEREF_F32(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_DOUBLE:
+      DEREF_F64(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_UINT8:
+      if (rtype_widen)
+        STORE_ARG_WIDENED_UNSIGNED(rvalue, result & 0xff);
+      else
+        DEREF_U8(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_SINT8:
+      if (rtype_widen)
+        STORE_ARG_WIDENED_SIGNED(rvalue, (result << 24) >> 24);
+      else
+        DEREF_U8(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_UINT16:
+      if (rtype_widen)
+        STORE_ARG_WIDENED_UNSIGNED(rvalue, result & 0xffff);
+      else
+        DEREF_U16(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_SINT16:
+      if (rtype_widen)
+        STORE_ARG_WIDENED_SIGNED(rvalue, (result << 16) >> 16);
+      else
+        DEREF_U16(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_UINT64:
+    case FFI_TYPE_SINT64:
+      DEREF_U64(rvalue, 0) = result;
+      break;
+    case FFI_TYPE_POINTER:
+      DEREF_PTR(rvalue, 0) = result;
+      break;
+    default:
+      throw new Error('Unexpected rtype ' + rtype_id);
+    }
+  };
+}
+
+var ffi_call_trampoline_module_cache = new Map();
+function ffi_call_trampoline_module(sig) {
+  var cache = ffi_call_trampoline_module_cache;
+  var module = cache.get(sig);
+  if (module) {
+    return module;
+  }
+  var P = PTR_WASM_TYPE;
+  var params = ffi_sig_to_wasm_types(sig.slice(1));
+  var results = ffi_sig_to_wasm_types(sig[0] === 'v' ? "" : sig[0]);
+  module = ffi_build_trampoline_module({
+    trampoline: [[P, P, P, P], []],                // (cif, fn, rvalue, avalue)
+    prelude:    [[P, P, P, P], [P, P, P, ...params, P]], // -> cif, orig_sp, rvalue, ...args, fn
+    callee:     [params, results],                 // fn(...args)
+    epilogue:   [[P, P, P, ...results], []],       // (cif, orig_sp, rvalue, result?)
+    nparams: 4,
+  });
+  LOG_DEBUG("CALL_MODULE", "sig:", sig);
+  cache.set(sig, module);
+  return module;
+}
+
+// Shared machinery for the ffi_call and closure trampolines. Both have the
+// shape
+//
+//    (func (export "f") (type trampoline)
+//      local.get 0 ... local.get nparams-1
+//      call prelude
+//      [i32.wrap_i64]
+//      call_indirect callee
+//      call epilogue)
+//
+
+// with prelude and epilogue imported from JS as "e.p" and "e.e" and the
+// function table imported as "e.t". prelude returns, in this order, epilogue's
+// leading arguments, callee's arguments, and callee's table index, so that
+// every value is consumed straight off the operand stack and the function needs
+// no locals.
+function ffi_build_trampoline_module({ trampoline, prelude, callee, epilogue, nparams }) {
+  function uleb128(n) {
+    var result = [];
+    do {
+      var byte = n & 0x7f;
+      n >>>= 7;
+      if (n) {
+        byte |= 0x80;
+      }
+      result.push(byte);
+    } while (n);
+    return result;
+  }
+  // A vector of single-byte items
+  function vec(bytes) {
+    return [...uleb128(bytes.length), ...bytes];
+  }
+  function section(id, bytes) {
+    return [id, ...vec(bytes)];
+  }
+  function funcType([params, results]) {
+    return [0x60, ...vec(params), ...vec(results)];
   }
 
-  // A NULL rvalue means the caller discards the return value.
-  if (rvalue === 0) {
-    return;
-  }
+  // Is the function table 64-bit indexed?
+  // -sMEMORY64=2 compiles with 64-bit pointers but uses a 32-bit memory and
+  // table, so we have to i32.wrap_i64 pointers.
+  var idx64 = typeof wasmTable.length === 'bigint';
+  var idxFlag = idx64 ? 0x04 : 0x00;
+  // Pointers are wrapped to i32 to be used as a table index.
+  var wrapPtr = (PTR_WASM_TYPE === 0x7e && !idx64) ? [0xa7] : []; // i32.wrap_i64
 
-  // Otherwise the result was automatically converted from C into Javascript and
-  // we need to manually convert it back to C.
-  // Integral returns narrower than a register are widened to ffi_arg, as
-  // documented and as every native port does -- but only genuine scalar
-  // returns: an unboxed small-struct return keeps its natural width.
-  switch (rtype_id) {
-  case FFI_TYPE_VOID:
-    break;
-  case FFI_TYPE_INT:
-  case FFI_TYPE_SINT32:
-    if (rtype_widen)
-      STORE_ARG_WIDENED_SIGNED(rvalue, result | 0);
-    else
-      DEREF_U32(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_UINT32:
-    if (rtype_widen)
-      STORE_ARG_WIDENED_UNSIGNED(rvalue, result | 0);
-    else
-      DEREF_U32(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_FLOAT:
-    DEREF_F32(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_DOUBLE:
-    DEREF_F64(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_UINT8:
-    if (rtype_widen)
-      STORE_ARG_WIDENED_UNSIGNED(rvalue, result & 0xff);
-    else
-      DEREF_U8(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_SINT8:
-    if (rtype_widen)
-      STORE_ARG_WIDENED_SIGNED(rvalue, (result << 24) >> 24);
-    else
-      DEREF_U8(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_UINT16:
-    if (rtype_widen)
-      STORE_ARG_WIDENED_UNSIGNED(rvalue, result & 0xffff);
-    else
-      DEREF_U16(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_SINT16:
-    if (rtype_widen)
-      STORE_ARG_WIDENED_SIGNED(rvalue, (result << 16) >> 16);
-    else
-      DEREF_U16(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_UINT64:
-  case FFI_TYPE_SINT64:
-    DEREF_U64(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_POINTER:
-    DEREF_PTR(rvalue, 0) = result;
-    break;
-  case FFI_TYPE_COMPLEX:
-    throw new Error('complex ret marshalling nyi');
-  default:
-    throw new Error('Unexpected rtype ' + rtype_id);
+  var typeSection = section(0x01, [
+    ...uleb128(4),
+    ...funcType(trampoline), // type 0
+    ...funcType(prelude),    // type 1
+    ...funcType(callee),     // type 2
+    ...funcType(epilogue),   // type 3
+  ]);
+  var importSection = section(0x02, [
+    ...uleb128(3),
+    // prelude: (import "e" "p" (func (type 1)))
+    0x01, 0x65, 0x01, 0x70, 0x00, 0x01,
+    // epilogue: (import "e" "e" (func (type 3)))
+    0x01, 0x65, 0x01, 0x65, 0x00, 0x03,
+    // (import "e" "t" (table 0 funcref))
+    0x01, 0x65, 0x01, 0x74, 0x01, 0x70, 0x00 | idxFlag, 0x00,
+  ]);
+  // One function, of type 0.
+  var functionSection = section(0x03, [0x01, 0x00]);
+  // (export "f" (func 2)) -- funcs 0 and 1 are the imports.
+  var exportSection = section(0x07, [0x01, 0x01, 0x66, 0x00, 0x02]);
+
+  // Function body
+  var body = [0x00]; // no locals
+  for (var i = 0; i < nparams; i++) {
+    body.push(0x20, ...uleb128(i)); // local.get i
   }
-});
+  body.push(0x10, 0x00); // call prelude
+  body.push(...wrapPtr); // the table index is on top of the stack
+  body.push(0x11, 0x02, 0x00); // call_indirect (type 2) (table 0)
+  body.push(0x10, 0x01); // call epilogue
+  body.push(0x0b); // end
+  var codeSection = section(0x0a, [...uleb128(1), ...vec(body)]);
+
+  var bytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, // magic
+    0x01, 0x00, 0x00, 0x00, // version
+    ...typeSection,
+    ...importSection,
+    ...functionSection,
+    ...exportSection,
+    ...codeSection,
+  ]);
+  // The module is tiny so compiling synchronously is fine.
+  return new WebAssembly.Module(bytes);
+}
+
+function ffi_sig_to_wasm_types(sig) {
+  var typeCodes = { 'i': 0x7f, 'j': 0x7e, 'f': 0x7d, 'd': 0x7c };
+  return Array.from(sig, (c) => typeCodes[c]);
+}
+)
+
+typedef void (*ffi_call_trampoline)(ffi_cif *, void (*)(void), void *, void **);
 
 void ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue) {
-  ffi_call_js(cif, fn, rvalue, avalue);
+  ffi_call_trampoline tramp = ffi_call_get_trampoline_js(cif);
+  tramp(cif, fn, rvalue, avalue);
 }
 
 #if __SIZEOF_POINTER__ == 4
@@ -763,8 +932,9 @@ function ffi_cif_to_call_info(cif) {
       throw new Error('Unexpected argtype ' + arg_type_id);
     }
   }
-  if (nfixedargs < nargs) {
-    // extra pointer to varargs stack
+  if (CIF__FLAGS(cif) & VARARGS_FLAG) {
+    // A variadic function takes an extra pointer to the varargs stack, even
+    // when no variadic arguments are actually passed (nfixedargs == nargs).
     sig += PTR_SIG;
   }
   return {
@@ -954,91 +1124,17 @@ function ffi_closure_trampoline_module(sig) {
   if (module) {
     return module;
   }
-
-  function uleb128(n) {
-    var result = [];
-    do {
-      var byte = n & 0x7f;
-      n >>>= 7;
-      if (n) {
-        byte |= 0x80;
-      }
-      result.push(byte);
-    } while (n);
-    return result;
-  }
-  // A vector of single-byte items
-  function vec(bytes) {
-    return [...uleb128(bytes.length), ...bytes];
-  }
-  function section(id, bytes) {
-    return [id, ...vec(bytes)];
-  }
-  function funcType(params, results) {
-    return [0x60, ...vec(params), ...vec(results)];
-  }
-
-  var typeCodes = { 'i': 0x7f, 'j': 0x7e, 'f': 0x7d, 'd': 0x7c };
   var P = PTR_WASM_TYPE;
-  var params = Array.from(sig.slice(1), (c) => typeCodes[c]);
-  var results = sig[0] === 'v' ? [] : [typeCodes[sig[0]]];
-  var nparams = params.length;
-
-  // Is the function table 64-bit indexed?
-  // -sMEMORY64=2 compiles with 64-bit pointers but uses a 32-bit memory and
-  // table, so we have to i32.wrap_i64 pointers.
-  var idx64 = typeof wasmTable.length === 'bigint';
-  var idxFlag = idx64 ? 0x04 : 0x00;
-  // Pointers are wrapped to i32 to be used as a table index.
-  var wrapPtr = (P === 0x7e && !idx64) ? [0xa7] : []; // i32.wrap_i64
-
-  var typeSection = section(0x01, [
-    ...uleb128(4),
-    ...funcType(params, results),               // type 0: the trampoline itself
-    ...funcType(params, [P, P, P, P, P, P, P]), // type 1: prelude
-    ...funcType([P, P, P, P], []),              // type 2: closure->fun(cif, ret, args, user_data)
-    ...funcType([P, P], results),               // type 3: epilogue(ret_ptr, orig_sp)
-  ]);
-  var importSection = section(0x02, [
-    ...uleb128(3),
-    // prelude: (import "e" "p" (func (type 1)))
-    0x01, 0x65, 0x01, 0x70, 0x00, 0x01,
-    // epilogue: (import "e" "e" (func (type 3)))
-    0x01, 0x65, 0x01, 0x65, 0x00, 0x03,
-    // (import "e" "t" (table 0 funcref))
-    0x01, 0x65, 0x01, 0x74, 0x01, 0x70, 0x00 | idxFlag, 0x00,
-  ]);
-  // One function, of type 0.
-  var functionSection = section(0x03, [0x01, 0x00]);
-  // (export "f" (func 2)) -- funcs 0 and 1 are the imports.
-  var exportSection = section(0x07, [0x01, 0x01, 0x66, 0x00, 0x02]);
-
-  // Function body
-  var body = [0x00]; // no locals
-  for (var i = 0; i < nparams; i++) {
-    body.push(0x20, ...uleb128(i)); // local.get i
-  }
-  body.push(0x10, 0x00); // call prelude
-  // Operand stack is now: ret_ptr, orig_sp, cif, ret_ptr, args_ptr, user_data, fun
-  body.push(...wrapPtr); // fun is used as a table index
-  body.push(0x11, 0x02, 0x00); // call_indirect (type 2) (table 0), consumes the top 5
-  // Operand stack: ret_ptr, orig_sp
-  body.push(0x10, 0x01); // call epilogue, consumes both and leaves the result (if any)
-  body.push(0x0b); // end
-  var codeSection = section(0x0a, [...uleb128(1), ...vec(body)]);
-
-  var bytes = new Uint8Array([
-    0x00, 0x61, 0x73, 0x6d, // magic
-    0x01, 0x00, 0x00, 0x00, // version
-    ...typeSection,
-    ...importSection,
-    ...functionSection,
-    ...exportSection,
-    ...codeSection,
-  ]);
-  LOG_DEBUG("CLOSURE_MODULE", "sig:", sig, "bytes:", bytes);
-  // The module is tiny so compiling synchronously is fine.
-  module = new WebAssembly.Module(bytes);
+  var params = ffi_sig_to_wasm_types(sig.slice(1));
+  var results = ffi_sig_to_wasm_types(sig[0] === 'v' ? "" : sig[0]);
+  module = ffi_build_trampoline_module({
+    trampoline: [params, results],                 // the closure's own signature
+    prelude:    [params, [P, P, P, P, P, P, P]],   // -> ret_ptr, orig_sp, cif, ret_ptr, args_ptr, user_data, fun
+    callee:     [[P, P, P, P], []],                // closure->fun(cif, ret, args, user_data)
+    epilogue:   [[P, P], results],                 // (ret_ptr, orig_sp) -> result
+    nparams: params.length,
+  });
+  LOG_DEBUG("CLOSURE_MODULE", "sig:", sig);
   cache.set(sig, module);
   return module;
 }

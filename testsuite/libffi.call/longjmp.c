@@ -32,13 +32,13 @@ int main()
   ffi_type *args[1];
   void *values[1];
   char *s;
-  ffi_arg rc;
   /* Initialize the argument info vectors */
   args[0] = &ffi_type_pointer;
   values[0] = &s;
-  /* Initialize the cif */
+  /* Initialize the cif. lev1 returns void; on wasm a call through a
+     mismatched signature traps, so the cif must say so too. */
   if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 1,
-    &ffi_type_sint, args) == FFI_OK)
+    &ffi_type_void, args) == FFI_OK)
   {
     s = "direct call";
     if (!setjmp(buf)){
@@ -51,7 +51,7 @@ int main()
     s = "through libffi";
     if (!setjmp(buf)){
       // works on x64 but segfaults on arm64
-      ffi_call(&cif, (void (*)(void))lev1, &rc, values);
+      ffi_call(&cif, (void (*)(void))lev1, NULL, values);
     } else {
       printf("back to main\n");
     }
